@@ -34,8 +34,10 @@ struct Args {
     filters: Option<Vec<String>>,
 }
 
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     let done = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(MAX_THREADS));
 
@@ -112,7 +114,7 @@ async fn git_clone(repo: &str) -> () {
         .await;
 }
 
-async fn get_list_of_repos(github_org: &str) -> anyhow::Result<Vec<String>> {
+async fn get_list_of_repos(github_org: &str) -> Result<Vec<String>> {
     let output = Command::new("gh")
         .args(["repo", "list", github_org, "--json", "sshUrl", "-L", "1000"])
         .output()
@@ -121,19 +123,19 @@ async fn get_list_of_repos(github_org: &str) -> anyhow::Result<Vec<String>> {
     let output = match output {
         Ok(output) => output,
         Err(e) => {
-            anyhow::bail!("Failed to execute gh command: {e}");
+            return Err(format!("Failed to execute gh command: {e}").into());
         }
     };
 
     if !output.status.success() {
-        anyhow::bail!("gh repo list failed");
+        return Err("gh repo list failed".into());
     }
 
     let repos: Vec<String> = parse_gh_output(&output.stdout)?;
     Ok(repos)
 }
 
-fn parse_gh_output(output: &[u8]) -> anyhow::Result<Vec<String>> {
+fn parse_gh_output(output: &[u8]) -> Result<Vec<String>> {
     let repos = serde_json::from_slice::<Vec<serde_json::Value>>(output)?
         .into_iter()
         .map(|obj| obj["sshUrl"].as_str().unwrap().to_string())
