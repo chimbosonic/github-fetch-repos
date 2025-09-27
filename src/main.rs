@@ -89,8 +89,6 @@ fn get_repo_name(ssh_url: &RepoSshUrl) -> Result<String> {
 async fn git_fetch(name: &RepoName) -> Result<()> {
     let output = Command::new("git")
         .args(["-C", name, "fetch", "--all"])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
         .status()
         .await;
 
@@ -106,8 +104,6 @@ async fn git_fetch(name: &RepoName) -> Result<()> {
 async fn git_clone(ssh_url: &RepoSshUrl) -> Result<()> {
     let output = Command::new("git")
         .args(["clone", ssh_url])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
         .status()
         .await;
 
