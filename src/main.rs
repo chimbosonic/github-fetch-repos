@@ -8,38 +8,17 @@ use std::sync::{
 };
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+
+mod types;
+use crate::types::*;
 
 static MAX_THREADS: usize = 5;
 
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    #[arg(
-        short,
-        long,
-        default_value = "chimbosonic",
-        help = "GitHub organization"
-    )]
-    github_org: String,
-
-    #[arg(short, long, help = "Perform a dry run without making any changes")]
-    dry_run: bool,
-
-    #[arg(
-        short,
-        long,
-        help = "List of repo name filters to exclude",
-        value_delimiter = ','
-    )]
-    filters: Option<Vec<String>>,
-}
-
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let done = Arc::new(AtomicUsize::new(0));
-    let sem = Arc::new(Semaphore::new(MAX_THREADS));
+    let done_counter = Arc::new(AtomicUsize::new(0));
+    let semaphore = Arc::new(Semaphore::new(MAX_THREADS));
 
     let args = Args::parse();
 
@@ -51,8 +30,7 @@ async fn main() -> Result<()> {
     if args.dry_run {
         println!("Dry run mode enabled. The following repositories would be processed:");
         for repo in &repos {
-            let name = get_repo_name(repo);
-            println!(" - {name}");
+            println!(" - {}", repo.name);
         }
         println!("Total repositories to be processed: {total}");
         return Ok(());
@@ -60,26 +38,11 @@ async fn main() -> Result<()> {
 
     println!("🚀 Starting to process {total} repos with max {MAX_THREADS} concurrent jobs...");
 
-    stream::iter(repos.into_iter().map(|repo| {
-        let done = done.clone();
-        let sem = sem.clone();
-
-        tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let name = get_repo_name(&repo);
-
-            if Path::new(&name).exists() {
-                println!("[{name}] already exists, fetching...");
-                git_fetch(&name).await;
-            } else {
-                println!("Cloning [{name}]...");
-                git_clone(&repo).await;
-            }
-
-            let finished = done.fetch_add(1, Ordering::SeqCst) + 1;
-            println!("✅ [{finished}/{total}] Finished {name}");
-        })
-    }))
+    stream::iter(
+        repos
+            .into_iter()
+            .map(|repo| process_repo(semaphore.clone(), done_counter.clone(), repo, total)),
+    )
     .buffer_unordered(MAX_THREADS)
     .collect::<Vec<_>>()
     .await;
@@ -88,15 +51,39 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn get_repo_name(repo: &str) -> String {
-    repo.split('/')
-        .next_back()
-        .unwrap()
-        .trim_end_matches(".git")
-        .to_string()
+async fn process_repo(
+    semaphore: Arc<Semaphore>,
+    done_counter: Arc<AtomicUsize>,
+    repo: Repo,
+    repo_total: usize,
+) -> () {
+        let _permit = semaphore.acquire().await.unwrap();
+
+        let name = repo.name;
+
+        if Path::new(&name).exists() {
+            println!("[{name}] already exists, fetching...");
+            git_fetch(&name).await;
+        } else {
+            println!("Cloning [{name}]...");
+            git_clone(&repo.ssh_url).await;
+        }
+
+        let finished = done_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        println!("✅ [{finished}/{repo_total}] Finished {name}");
+    
 }
 
-async fn git_fetch(name: &str) -> () {
+fn get_repo_name(ssh_url: &RepoSshUrl) -> Result<String> {
+    Ok(ssh_url
+        .split('/')
+        .next_back()
+        .ok_or("Failed to get repo name")?
+        .trim_end_matches(".git")
+        .to_string())
+}
+
+async fn git_fetch(name: &RepoName) -> () {
     let _ = Command::new("git")
         .args(["-C", name, "fetch", "--all"])
         .stdout(Stdio::inherit())
@@ -105,22 +92,21 @@ async fn git_fetch(name: &str) -> () {
         .await;
 }
 
-async fn git_clone(repo: &str) -> () {
+async fn git_clone(ssh_url: &RepoSshUrl) -> () {
     let _ = Command::new("git")
-        .args(["clone", repo])
+        .args(["clone", ssh_url])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .await;
 }
 
-async fn get_list_of_repos(github_org: &str) -> Result<Vec<String>> {
-    let output = Command::new("gh")
+async fn get_list_of_repos(github_org: &str) -> Result<Vec<Repo>> {
+    let output = match Command::new("gh")
         .args(["repo", "list", github_org, "--json", "sshUrl", "-L", "1000"])
         .output()
-        .await;
-
-    let output = match output {
+        .await
+    {
         Ok(output) => output,
         Err(e) => {
             return Err(format!("Failed to execute gh command: {e}").into());
@@ -128,35 +114,44 @@ async fn get_list_of_repos(github_org: &str) -> Result<Vec<String>> {
     };
 
     if !output.status.success() {
-        return Err("gh repo list failed".into());
+        return Err("gh command failed".into());
     }
 
-    let repos: Vec<String> = parse_gh_output(&output.stdout)?;
-    Ok(repos)
+    parse_gh_output(&output.stdout)
 }
 
-fn parse_gh_output(output: &[u8]) -> Result<Vec<String>> {
-    let repos = serde_json::from_slice::<Vec<serde_json::Value>>(output)?
-        .into_iter()
-        .map(|obj| obj["sshUrl"].as_str().unwrap().to_string())
-        .collect();
-    Ok(repos)
+impl TryFrom<&GHOuput> for Repo {
+    type Error = Error;
+
+    fn try_from(value: &GHOuput) -> Result<Repo> {
+        let name = get_repo_name(&value.sshUrl)?;
+
+        Ok(Self {
+            ssh_url: value.sshUrl.clone(),
+            name,
+        })
+    }
 }
 
-fn filter_repos(repos: Vec<String>, filters: Option<Vec<String>>) -> Vec<String> {
+fn parse_gh_output(output: &[u8]) -> Result<Vec<Repo>> {
+    let repos: Vec<GHOuput> = serde_json::from_slice(output)?;
+    repos.iter().map(Repo::try_from).collect()
+}
+
+fn filter_repos(repos: Vec<Repo>, filters: Option<Vec<String>>) -> Vec<Repo> {
     if let Some(custom_filters) = filters {
         return repos
             .into_iter()
-            .filter(|repo| !check_filter(repo, custom_filters.clone()))
+            .filter(|repo| !check_filter(&repo.ssh_url, &custom_filters))
             .collect();
     }
 
     repos
 }
 
-fn check_filter(repo: &str, filters: Vec<String>) -> bool {
+fn check_filter(ssh_url: &RepoSshUrl, filters: &Vec<String>) -> bool {
     for filter in filters {
-        if repo.contains(&filter) {
+        if ssh_url.contains(filter) {
             return true;
         }
     }
@@ -164,37 +159,4 @@ fn check_filter(repo: &str, filters: Vec<String>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_check_filter() {
-        assert_eq!(
-            check_filter(
-                "git@github.com:chimbosonic/hackers.chimbosonic.com.git",
-                vec!["hackers".to_string()]
-            ),
-            true
-        );
-    }
-
-    #[test]
-    fn test_get_repo_name() {
-        assert_eq!(
-            get_repo_name("git@github.com:chimbosonic/hackers.chimbosonic.com.git"),
-            "hackers.chimbosonic.com"
-        );
-    }
-
-    #[test]
-    fn test_parse_gh_output() {
-        let data = r#"[{"sshUrl":"git@github.com:chimbosonic/cli-kneeboard.git"},{"sshUrl":"git@github.com:chimbosonic/chimbosonic.com.git"}]"#;
-
-        let repos = parse_gh_output(data.as_bytes()).unwrap();
-
-        assert_eq!(repos.len(), 2);
-
-        assert_eq!(repos[0], "git@github.com:chimbosonic/cli-kneeboard.git");
-        assert_eq!(repos[1], "git@github.com:chimbosonic/chimbosonic.com.git");
-    }
-}
+mod tests;
