@@ -8,7 +8,6 @@ use std::sync::{
 };
 use tokio::process::Command;
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
 
 mod types;
 use crate::types::*;
@@ -57,21 +56,22 @@ async fn process_repo(
     repo: Repo,
     repo_total: usize,
 ) -> () {
-        let _permit = semaphore.acquire().await.unwrap();
+    let _permit = semaphore.acquire().await.unwrap();
 
-        let name = repo.name;
+    let name = repo.name;
 
-        if Path::new(&name).exists() {
-            println!("[{name}] already exists, fetching...");
-            git_fetch(&name).await;
-        } else {
-            println!("Cloning [{name}]...");
-            git_clone(&repo.ssh_url).await;
-        }
+    if Path::new(&name).exists() {
+        println!("[{name}] already exists, fetching...");
+        let _ = git_fetch(&name).await.map_err(|err| println!("{err}"));
+    } else {
+        println!("Cloning [{name}]...");
+        let _ = git_clone(&repo.ssh_url)
+            .await
+            .map_err(|err| println!("{err}"));
+    }
 
-        let finished = done_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        println!("✅ [{finished}/{repo_total}] Finished {name}");
-    
+    let finished = done_counter.fetch_add(1, Ordering::SeqCst) + 1;
+    println!("✅ [{finished}/{repo_total}] Finished {name}");
 }
 
 fn get_repo_name(ssh_url: &RepoSshUrl) -> Result<String> {
@@ -83,22 +83,38 @@ fn get_repo_name(ssh_url: &RepoSshUrl) -> Result<String> {
         .to_string())
 }
 
-async fn git_fetch(name: &RepoName) -> () {
-    let _ = Command::new("git")
+async fn git_fetch(name: &RepoName) -> Result<()> {
+    let output = Command::new("git")
         .args(["-C", name, "fetch", "--all"])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .await;
+
+    match output {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            Err(format!("git fetch failed for {name} (code: {:?})", status.code()).into())
+        }
+        Err(err) => Err(format!("failed to run git fetch for {name}: {err}").into()),
+    }
 }
 
-async fn git_clone(ssh_url: &RepoSshUrl) -> () {
-    let _ = Command::new("git")
+async fn git_clone(ssh_url: &RepoSshUrl) -> Result<()> {
+    let output = Command::new("git")
         .args(["clone", ssh_url])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .await;
+
+    match output {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            Err(format!("git clone failed for {ssh_url} (code: {:?})", status.code()).into())
+        }
+        Err(err) => Err(format!("failed to run git clone for {ssh_url}: {err}").into()),
+    }
 }
 
 async fn get_list_of_repos(github_org: &str) -> Result<Vec<Repo>> {
