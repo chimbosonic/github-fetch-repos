@@ -40,4 +40,7 @@ pub struct Args {
         value_delimiter = ','
     )]
     pub filters: Option<Vec<String>>,
+
+    #[arg(short, long, default_value = "5", help = "Max Thread Count (10 max)")]
+    pub max_threads: usize,
 }

@@ -12,13 +12,8 @@ use tokio::sync::Semaphore;
 mod types;
 use crate::types::*;
 
-static MAX_THREADS: usize = 5;
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let done_counter = Arc::new(AtomicUsize::new(0));
-    let semaphore = Arc::new(Semaphore::new(MAX_THREADS));
-
     let args = Args::parse();
 
     println!("🔍 Fetching list of repos...");
@@ -35,14 +30,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("🚀 Starting to process {total} repos with max {MAX_THREADS} concurrent jobs...");
+    let max_threads: usize = args.max_threads;
+    if max_threads >= 10 {
+        return Err("Please use less than 10 threads".into());
+    };
+
+    let done_counter = Arc::new(AtomicUsize::new(0));
+    let semaphore = Arc::new(Semaphore::new(max_threads));
+
+    println!("🚀 Starting to process {total} repos with max {max_threads} concurrent jobs...");
 
     stream::iter(
         repos
             .into_iter()
             .map(|repo| process_repo(semaphore.clone(), done_counter.clone(), repo, total)),
     )
-    .buffer_unordered(MAX_THREADS)
+    .buffer_unordered(max_threads)
     .collect::<Vec<_>>()
     .await;
 
