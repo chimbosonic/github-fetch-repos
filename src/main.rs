@@ -1,7 +1,6 @@
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -18,13 +17,18 @@ async fn main() -> Result<()> {
 
     println!("🔍 Fetching list of repos...");
     let repos = get_list_of_repos(&args.github_org).await?;
-    let repos = filter_repos(repos, args.filters);
+    let mut repos = filter_repos(repos, args.filters);
+    if args.https {
+        repos
+            .iter_mut()
+            .for_each(|repo| repo.method = RepoMethod::Https);
+    }
     let total = repos.len();
 
     if args.dry_run {
         println!("Dry run mode enabled. The following repositories would be processed:");
         for repo in &repos {
-            println!(" - {}", repo.name);
+            println!(" - {}: {}", repo.name, repo.url());
         }
         println!("Total repositories to be processed: {total}");
         return Ok(());
@@ -61,16 +65,14 @@ async fn process_repo(
 ) -> () {
     let _permit = semaphore.acquire().await.unwrap();
 
-    let name = repo.name;
+    let name = &repo.name;
 
-    if Path::new(&name).exists() {
+    if Path::new(name).exists() {
         println!("[{name}] already exists, fetching...");
-        let _ = git_fetch(&name).await.map_err(|err| println!("{err}"));
+        let _ = repo.fetch().await.map_err(|err| println!("{err}"));
     } else {
         println!("Cloning [{name}]...");
-        let _ = git_clone(&repo.ssh_url)
-            .await
-            .map_err(|err| println!("{err}"));
+        let _ = repo.clone().await.map_err(|err| println!("{err}"));
     }
 
     let finished = done_counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -86,39 +88,51 @@ fn get_repo_name(ssh_url: &RepoSshUrl) -> Result<String> {
         .to_string())
 }
 
-async fn git_fetch(name: &RepoName) -> Result<()> {
-    let output = Command::new("git")
-        .args(["-C", name, "fetch", "--all"])
-        .status()
-        .await;
-
-    match output {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => {
-            Err(format!("git fetch failed for {name} (code: {:?})", status.code()).into())
+impl Repo {
+    fn url(&self) -> String {
+        match self.method {
+            RepoMethod::Https => self.https_url.clone(),
+            RepoMethod::Ssh => self.ssh_url.clone(),
         }
-        Err(err) => Err(format!("failed to run git fetch for {name}: {err}").into()),
     }
-}
 
-async fn git_clone(ssh_url: &RepoSshUrl) -> Result<()> {
-    let output = Command::new("git")
-        .args(["clone", ssh_url])
-        .status()
-        .await;
+    async fn fetch(&self) -> Result<()> {
+        let name = &self.name;
+        let output = Command::new("git")
+            .args(["-C", name, "fetch", "--all"])
+            .status()
+            .await;
 
-    match output {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => {
-            Err(format!("git clone failed for {ssh_url} (code: {:?})", status.code()).into())
+        match output {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => {
+                Err(format!("git fetch failed for {name} (code: {:?})", status.code()).into())
+            }
+            Err(err) => Err(format!("failed to run git fetch for {name}: {err}").into()),
         }
-        Err(err) => Err(format!("failed to run git clone for {ssh_url}: {err}").into()),
+    }
+
+    async fn clone(&self) -> Result<()> {
+        let name = &self.name;
+        let url = &self.url();
+
+        let output = Command::new("git").args(["clone", url]).status().await;
+
+        match output {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => {
+                Err(format!("git clone failed for {name} (code: {:?})", status.code()).into())
+            }
+            Err(err) => Err(format!("failed to run git clone for {name}: {err}").into()),
+        }
     }
 }
 
 async fn get_list_of_repos(github_org: &str) -> Result<Vec<Repo>> {
     let output = match Command::new("gh")
-        .args(["repo", "list", github_org, "--json", "sshUrl", "-L", "1000"])
+        .args([
+            "repo", "list", github_org, "--json", "sshUrl", "--json", "url", "-L", "1000",
+        ])
         .output()
         .await
     {
@@ -143,7 +157,9 @@ impl TryFrom<&GHOuput> for Repo {
 
         Ok(Self {
             ssh_url: value.sshUrl.clone(),
+            https_url: format!("{}.git", value.url),
             name,
+            method: RepoMethod::Ssh,
         })
     }
 }
@@ -157,16 +173,19 @@ fn filter_repos(repos: Vec<Repo>, filters: Option<Vec<String>>) -> Vec<Repo> {
     if let Some(custom_filters) = filters {
         return repos
             .into_iter()
-            .filter(|repo| !check_filter(&repo.ssh_url, &custom_filters))
+            .filter(|repo| !check_filter(repo, &custom_filters))
             .collect();
     }
 
     repos
 }
 
-fn check_filter(ssh_url: &RepoSshUrl, filters: &Vec<String>) -> bool {
+fn check_filter(repo: &Repo, filters: &Vec<String>) -> bool {
+    let name = repo.name.to_lowercase();
     for filter in filters {
-        if ssh_url.contains(filter) {
+        let filter = filter.to_lowercase();
+
+        if name.contains(&filter) {
             return true;
         }
     }
